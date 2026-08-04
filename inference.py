@@ -14,12 +14,17 @@ Set the MODEL_BACKEND environment variable to one of:
 
 import os
 import numpy as np
+from pathlib import Path
+from dotenv import load_dotenv
 from ai.preprocessing import preprocess
 from ai.postprocessing import postprocess
 
-MODEL_BACKEND = os.getenv("MODEL_BACKEND", "onnx")
-ONNX_MODEL_PATH = os.getenv("ONNX_MODEL_PATH", "ai/models/model.onnx")
-TORCH_MODEL_PATH = os.getenv("TORCH_MODEL_PATH", "ai/models/model.pth")
+# Load AI-Background-Remover-AI/.env (the file lives next to inference.py)
+load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+
+MODEL_BACKEND    = os.getenv("MODEL_BACKEND",    "rembg")
+ONNX_MODEL_PATH  = os.getenv("ONNX_MODEL_PATH",  "models/model.onnx")
+TORCH_MODEL_PATH = os.getenv("TORCH_MODEL_PATH", "models/model.pth")
 
 
 # ---------------------------------------------------------------------------
