@@ -16,8 +16,8 @@ import os
 import numpy as np
 from pathlib import Path
 from dotenv import load_dotenv
-from ai.preprocessing import preprocess
-from ai.postprocessing import postprocess
+from preprocessing import preprocess
+from postprocessing import postprocess
 
 # Load AI-Background-Remover-AI/.env (the file lives next to inference.py)
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
