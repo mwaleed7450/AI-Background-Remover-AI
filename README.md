@@ -1,256 +1,260 @@
-# AI Background Remover — AI Module
+# 🤖 Team 3 — ML / AI
 
-> **Teams:** AI Team (pipeline integration) · ML Team (model research & training)
-> **Repo:** `AI-Background-Remover-AI`
-> **Parent repo:** `AI-Background-Remover` (this is a submodule)
-> **Tech:** Python 3.11 · PyTorch · ONNX Runtime · OpenCV · Pillow · rembg
+This is where the main ML work happens. This module covers intelligent background removal, edge refinement, image quality analysis, and a set of standalone AI-powered image features.
 
 ---
 
-## What This Repo Is
+## Background Removal & Refinement Pipeline
 
-The AI engine for the AI Background Remover application.
-It receives an image path, runs it through a deep learning segmentation model, and produces a transparent PNG.
-
-It is called by the backend (`services/bg_removal.py`) — it does not run a web server or accept HTTP requests itself.
-
----
-
-## Who Works Here
-
-| Team | Responsibility | Folders |
-|------|---------------|---------|
-| **AI Team** | Pipeline code — integrate models, write pre/postprocessing, optimize inference | `inference.py`, `preprocessing.py`, `postprocessing.py` |
-| **ML Team** | Model research — evaluate architectures, train, benchmark, export weights | `research/` (create this folder for notebooks and scripts) |
-
----
-
-## Folder Structure
+### 1. Smart Edge Refinement ⭐
 
 ```
-AI-Background-Remover-AI/
-│
-├── __init__.py                 ← marks this as a Python package (ai.*)
-│
-├── inference.py                ← PUBLIC entry point
-│                                 run_inference(image_path, output_path)
-│                                 switches between backends via MODEL_BACKEND env var
-│
-├── preprocessing.py            ← image loading, resize, normalize, to tensor
-│
-├── postprocessing.py           ← upsample mask, binarise, refine edges,
-│                                 apply alpha channel, save PNG
-│
-├── models/                     ← model weight files go here (not committed to git)
-│   └── .gitkeep
-│
-└── research/                   ← ML Team workspace (create as needed)
-    ├── notebooks/              ← Jupyter notebooks for experiments
-    ├── train.py                ← training scripts
-    ├── evaluate.py             ← benchmark accuracy / speed
-    └── export_onnx.py          ← export trained PyTorch model to ONNX
+Original Image
+      +
+Initial Mask
+      ↓
+ML Edge Refinement
+      ↓
+Improved Mask
 ```
+
+**Tasks**
+- [ ] Create/refine training dataset
+- [ ] Train/refine model
+- [ ] Hair/fine-edge handling
+- [ ] Evaluate IoU
+- [ ] Evaluate boundary accuracy
+- [ ] Integrate inference
 
 ---
 
-## The Three Backends
+### 2. Hair & Fur Detection
 
-The `inference.py` file supports three interchangeable backends.
-Switch between them by setting the `MODEL_BACKEND` environment variable.
-
-| Backend | Env value | When to use |
-|---------|-----------|-------------|
-| **rembg** | `MODEL_BACKEND=rembg` | Quickest start — no model file needed, downloads automatically |
-| **ONNX Runtime** | `MODEL_BACKEND=onnx` | Production — fastest CPU/GPU inference |
-| **PyTorch** | `MODEL_BACKEND=torch` | Development / fine-tuning — load `.pth` weights directly |
-
-**Default:** `rembg` (set in `.env.example`).
+**Tasks**
+- [ ] Hair/fur dataset
+- [ ] Fine-detail segmentation
+- [ ] Hair refinement model
+- [ ] Fur refinement
+- [ ] Edge preservation
+- [ ] Testing
 
 ---
 
-## How the Pipeline Works
+### 3. Multiple Object Detection
 
+**Detects**
 ```
-run_inference(image_path, output_path)
-        │
-        ├── if MODEL_BACKEND == "rembg"
-        │       rembg handles everything internally → saves PNG → done
-        │
-        └── else (onnx or torch)
-                │
-                ▼
-        preprocessing.preprocess(image_path)
-          1. Load image from disk (OpenCV → RGB numpy array)
-          2. Resize to 1024×1024 (Lanczos interpolation)
-          3. Normalize: (pixel/255 - ImageNet_mean) / ImageNet_std
-          4. Convert HWC → CHW → NCHW float32 tensor
-          Returns: (input_tensor, original_size)
-                │
-                ▼
-        _run_onnx(tensor)  OR  _run_torch(tensor)
-          Loads model weights, runs forward pass
-          Returns: raw probability mask (H, W) float32 in [0,1]
-                │
-                ▼
-        postprocessing.postprocess(raw_mask, image_path, output_path, original_size)
-          1. Upsample mask back to original image dimensions
-          2. Binarise: pixels >= 0.5 become 255 (foreground), rest 0
-          3. Refine edges: morphological open + close + Gaussian blur
-          4. Apply mask as alpha channel to original RGBA image
-          5. Save as transparent PNG
+Person
+Dog
+Bag
+Car
+Product
+etc.
+```
+
+**Tasks**
+- [ ] Object detection
+- [ ] Object segmentation
+- [ ] Object IDs
+- [ ] Generate individual masks
+- [ ] Return selectable objects
+
+---
+
+### 4. Image Quality Analysis
+
+**Detects**
+- [ ] Blur
+- [ ] Noise
+- [ ] Low resolution
+- [ ] Poor lighting
+- [ ] Compression quality
+
+**Sample Output**
+```
+Resolution: Good
+Blur: Low
+Noise: Medium
+Lighting: Poor
+Overall Quality: 78%
 ```
 
 ---
 
-## Public API (what the backend calls)
+### 5. Background Complexity Detection
 
-```python
-from ai.inference import run_inference
-
-run_inference(
-    image_path="uploads/abc123_photo.jpg",
-    output_path="output/abc123_result.png"
-)
+**Classifies**
+```
+Simple
+Medium
+Complex
 ```
 
-That is the only function the backend ever calls. Everything else is internal.
+Then automatically chooses appropriate processing.
 
 ---
 
-## Supported Segmentation Models
+### 6. Mask Quality Scoring
 
-These are the models the ML Team should evaluate and the AI Team integrates:
-
-| Model | Architecture | Best for |
-|-------|-------------|---------|
-| **U²-Net** | Encoder-decoder with nested U-structure | General background removal, fast |
-| **BiRefNet** | Bilateral Reference Network | Fine edge detail (hair, fur) |
-| **RMBG-2.0** | Hugging Face model (via `transformers`) | Easy to load, good accuracy |
-| **rembg** | U²-Net wrapper | Quickest to deploy, auto-downloads |
-
----
-
-## Adding or Swapping a Model
-
-### Using rembg (easiest)
-No setup needed. Just set `MODEL_BACKEND=rembg` in `.env`.
-
-### Using a custom ONNX model
-1. Export your model to ONNX format (see `research/export_onnx.py`).
-2. Place the `.onnx` file in `models/`.
-3. Set in `.env`:
-   ```
-   MODEL_BACKEND=onnx
-   ONNX_MODEL_PATH=ai/models/your_model.onnx
-   ```
-
-### Using a custom PyTorch model
-1. Save the trained model with `torch.save(model, path)`.
-2. Place the `.pth` file in `models/`.
-3. Set in `.env`:
-   ```
-   MODEL_BACKEND=torch
-   TORCH_MODEL_PATH=ai/models/your_model.pth
-   ```
-
-### Adding a brand-new backend
-1. Add a `_run_yourbackend(input_tensor)` function in `inference.py`.
-2. Add it to the `if/elif` chain in `run_inference()`.
-3. Add the new env value to `.env.example`.
-
----
-
-## Preprocessing Details
-
-File: `preprocessing.py`
-
-| Step | Function | Detail |
-|------|----------|--------|
-| Load | `load_image()` | OpenCV imread → BGR to RGB |
-| Resize | `resize_image()` | Target 1024×1024, INTER_LANCZOS4 |
-| Normalize | `normalise()` | ImageNet mean `[0.485, 0.456, 0.406]`, std `[0.229, 0.224, 0.225]` |
-| Tensor | `to_tensor()` | HWC → CHW → NCHW float32 |
-
-Input size `1024×1024` is the default for U²-Net / BiRefNet / RMBG-2.0.
-Change it via the `size` parameter if your model needs a different resolution.
-
----
-
-## Postprocessing Details
-
-File: `postprocessing.py`
-
-| Step | Function | Detail |
-|------|----------|--------|
-| Upsample | `upsample_mask()` | INTER_LINEAR resize back to original dims |
-| Binarise | `binarise_mask()` | Threshold at 0.5, output 0 or 255 |
-| Refine | `refine_mask()` | Morph open (remove noise) + close (fill holes) + Gaussian blur (smooth edges) |
-| Apply | `apply_mask()` | Set mask as alpha channel, save RGBA PNG |
-
----
-
-## Setup
-
-```bash
-# Copy the AI-specific environment config
-cp AI-Background-Remover-AI/.env.example AI-Background-Remover-AI/.env
-# Edit .env — set MODEL_BACKEND, and model paths if using onnx or torch
+**Sample Output**
 ```
-
-## Running Inference Directly (for testing)
-
-```python
-# From the project root with .venv active
-python -c "
-from AI_Background_Remover_AI.inference import run_inference
-run_inference('path/to/test.jpg', 'path/to/output.png')
-print('Done')
-"
+Mask Quality: 94%
+Edge Quality: 91%
+Subject Confidence: 97%
 ```
 
 ---
 
-## ML Team — Research Workflow
+### 7. Low-Light Enhancement
 
-1. Create a `research/` folder in this repo.
-2. Use Jupyter notebooks in `research/notebooks/` for experiments.
-3. Train your model, save checkpoints to `models/` (add to `.gitignore` — large files).
-4. Write an `export_onnx.py` script to convert the best checkpoint.
-5. Benchmark against rembg using metrics: IoU, F-measure, inference time.
-6. When a model beats rembg on the benchmark, hand the `.onnx` file to the AI Team for pipeline integration.
-7. Document results in `research/RESULTS.md`.
+**Tasks**
+- [ ] Detect dark images
+- [ ] Image enhancement model
+- [ ] Improve visibility
+- [ ] Feed enhanced image into segmentation
 
 ---
 
-## What Is Done vs What Is Next
+### 8. Blur & Noise Correction
 
-### Done
-- [x] Full preprocessing pipeline (load, resize, normalize, tensorize)
-- [x] Full postprocessing pipeline (upsample, binarise, refine, alpha apply)
-- [x] ONNX Runtime backend
-- [x] PyTorch backend
-- [x] rembg backend (working out of the box)
-- [x] `run_inference()` public entry point with env-based backend switching
-
-### Next — AI Team
-- [ ] Add BiRefNet backend integration
-- [ ] Add RMBG-2.0 (Hugging Face transformers) backend
-- [ ] GPU memory management for batched inference
-- [ ] Model caching (load once on startup, reuse per request)
-- [ ] Confidence threshold tuning via env variable
-
-### Next — ML Team
-- [ ] Set up `research/` folder structure
-- [ ] Benchmark rembg as baseline
-- [ ] Evaluate BiRefNet on standard datasets (P3M, DIS5K)
-- [ ] Evaluate RMBG-2.0
-- [ ] Export best model to ONNX
-- [ ] Document results in `research/RESULTS.md`
+```
+Input
+ ↓
+Detect Blur/Noise
+ ↓
+Enhancement
+ ↓
+Background Removal
+```
 
 ---
 
-## Contribution
+### 9. AI Image Upscaling
 
-See [CONTRIBUTING.md](../CONTRIBUTING.md) in the parent repo for branch naming, commit format, and PR rules.
+**Tasks**
+- [ ] Super-resolution model
+- [ ] 2× upscaling
+- [ ] 4× upscaling
+- [ ] Quality comparison
 
-Your branch always goes into this submodule repo (`AI-Background-Remover-AI`), not the parent.
+---
+
+### 10. Edge Decontamination
+
+Removes leftover background colors around edges.
+
+**Example**
+```
+Before:
+Subject + green halo
+
+After:
+Clean subject edge
+```
+
+---
+
+### 11. Automatic Shadow Detection
+
+Detects whether a shadow belongs to the subject.
+
+**Tasks (later phase)**
+- [ ] Shadow detection
+- [ ] Shadow mask
+- [ ] Shadow preservation
+- [ ] Optional shadow removal
+
+---
+
+## 🔥 Additional ML Features
+
+These are separate from normal background removal.
+
+### 12. AI Image Similarity Search ⭐
+
+```
+Upload Image
+     ↓
+Image Embedding
+     ↓
+Vector Search
+     ↓
+Similar Images
+```
+
+**Tasks**
+- [ ] Image embedding model
+- [ ] Generate embeddings
+- [ ] Vector database
+- [ ] Similarity calculation
+- [ ] Ranking
+- [ ] Similar-image API
+
+---
+
+### 13. AI Image Categorization
+
+**Classifies**
+```
+Portrait
+Product
+Food
+Animal
+Landscape
+Document
+Vehicle
+etc.
+```
+
+---
+
+### 14. Duplicate Image Detection
+
+**Detects**
+- [ ] Exact duplicates
+- [ ] Resized duplicates
+- [ ] Cropped duplicates
+- [ ] Slightly modified images
+
+---
+
+### 15. AI Color Palette Extraction
+
+**Extracts**
+```
+Primary Color
+Secondary Color
+Accent Color
+Dominant Colors
+```
+
+**Display**
+```
+████  ████  ████  ████  ████
+```
+
+---
+
+### 16. AI Image Composition Scoring
+
+**Analyzes**
+- [ ] Subject positioning
+- [ ] Balance
+- [ ] Lighting
+- [ ] Visual clarity
+- [ ] Composition
+
+**Sample Output**
+```
+Composition Score: 88%
+```
+
+---
+
+## 📋 Status Legend
+
+| Symbol | Meaning |
+|--------|---------|
+| ⭐ | High priority feature |
+| [ ] | Task not started |
+| [x] | Task completed |
