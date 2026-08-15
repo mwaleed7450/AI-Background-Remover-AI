@@ -12,20 +12,29 @@ Set the MODEL_BACKEND environment variable to one of:
   "rembg"  – uses the rembg library (default)
 
 Per-request quality selector (only applies to the "rembg" backend):
-  quality="fast"    → u2net          (small model, fast CPU inference)
-  quality="quality" → birefnet-general (BiRefNet, best edge quality)
+  quality="fast"     → isnet-general-use   (smallest+fastest, good general subjects)
+  quality="standard" → u2net_human_seg     (portrait-tuned U²-Net, best for people)
+  quality="quality"  → birefnet-general    (BiRefNet, best edge quality for anything)
 
-The model session is cached after the first load so switching quality
-levels within the same process reuses the cached session automatically.
+Speed notes (CPU):
+  isnet-general-use is ~40% faster than u2net on CPU inference.
+  u2net_human_seg is similar speed to isnet but trained exclusively on human
+  subjects — gives noticeably cleaner hair and skin edges for portraits.
+  BiRefNet gives the best edges but is significantly heavier — warm-up at
+  startup eliminates the first-request delay.
+
+The model session is cached after the first load so every subsequent request
+reuses the in-memory session — no reload cost.
 """
 
 import os
+import io
 import threading
 import numpy as np
 from pathlib import Path
 from dotenv import load_dotenv
 from preprocessing import preprocess
-from postprocessing import postprocess
+from postprocessing import postprocess, refine_rembg_output
 
 # Load AI-Background-Remover-AI/.env (the file lives next to inference.py)
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
@@ -37,10 +46,14 @@ TORCH_MODEL_PATH = os.getenv("TORCH_MODEL_PATH", "models/model.pth")
 # Default quality when callers do not specify (env override supported)
 DEFAULT_QUALITY = os.getenv("DEFAULT_QUALITY", "fast")
 
-# Map user-facing quality strings to rembg model IDs
+# Map user-facing quality strings to rembg model IDs.
+# isnet-general-use  — fastest, good for products/objects
+# u2net_human_seg    — portrait-tuned, best for people/faces
+# birefnet-general   — heaviest, best overall edge quality
 _REMBG_MODEL_IDS: dict[str, str] = {
-    "fast":    "u2net",
-    "quality": "birefnet-general",
+    "fast":     "isnet-general-use",
+    "standard": "u2net_human_seg",
+    "quality":  "birefnet-general",
 }
 
 # ---------------------------------------------------------------------------
@@ -58,7 +71,7 @@ def _get_rembg_session(model_id: str):
     first access.  Thread-safe.
 
     Args:
-        model_id: A rembg model identifier, e.g. "u2net" or "birefnet-general".
+        model_id: A rembg model identifier, e.g. "isnet-general-use".
 
     Returns:
         A rembg session object.
@@ -68,6 +81,34 @@ def _get_rembg_session(model_id: str):
             from rembg import new_session
             _session_cache[model_id] = new_session(model_id)
         return _session_cache[model_id]
+
+
+# ---------------------------------------------------------------------------
+# Public warm-up helper  (call once at server startup)
+# ---------------------------------------------------------------------------
+
+def warm_up_models() -> None:
+    """
+    Pre-load every rembg session into the cache so the very first real
+    request does not pay the model-download + initialisation cost.
+
+    This runs the session constructors (which download weights on first call)
+    but does NOT run inference — it is fast enough to call synchronously
+    inside the FastAPI lifespan startup hook.
+
+    Should only be called when MODEL_BACKEND == "rembg".
+    """
+    if MODEL_BACKEND != "rembg":
+        return
+
+    print("🔥 Pre-warming AI models…", flush=True)
+    for quality_label, model_id in _REMBG_MODEL_IDS.items():
+        try:
+            _get_rembg_session(model_id)
+            print(f"   ✅  {quality_label} ({model_id}) ready", flush=True)
+        except Exception as exc:
+            print(f"   ⚠️  Could not pre-warm {quality_label} ({model_id}): {exc}", flush=True)
+    print("🔥 Model warm-up complete.", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -126,28 +167,47 @@ def _run_torch(input_tensor: np.ndarray) -> np.ndarray:
     return mask.astype(np.float32)
 
 
-def _run_rembg(image_path: str, output_path: str, quality: str = "fast") -> None:
+def _run_rembg_bytes(image_bytes: bytes, quality: str = "fast") -> bytes:
     """
-    Use the rembg library to remove the background.
+    Use the rembg library to remove the background, operating entirely in
+    memory (no temporary files), then apply guided-matting post-processing
+    to sharpen edges.
 
     Args:
-        image_path:  Source image path.
-        output_path: Destination PNG path.
-        quality:     "fast" (u2net) or "quality" (birefnet-general).
+        image_bytes: Raw image file content (JPEG / PNG / WebP bytes).
+        quality:     "fast" (isnet-general-use) or "quality" (birefnet-general).
+
+    Returns:
+        Refined transparent PNG as raw bytes.
     """
     from rembg import remove
 
     model_id = _REMBG_MODEL_IDS.get(quality, _REMBG_MODEL_IDS["fast"])
     session  = _get_rembg_session(model_id)
+    raw      = remove(image_bytes, session=session)
 
+    # Apply guided-matting + morphological refinement on top of rembg output
+    return refine_rembg_output(raw)
+
+
+def _run_rembg(image_path: str, output_path: str, quality: str = "fast") -> None:
+    """
+    Use the rembg library to remove the background (file-based interface,
+    kept for compatibility with the ONNX/PyTorch pipeline paths).
+
+    Args:
+        image_path:  Source image path.
+        output_path: Destination PNG path.
+        quality:     "fast" or "quality".
+    """
     with open(image_path, "rb") as inp:
-        result = remove(inp.read(), session=session)
+        result = _run_rembg_bytes(inp.read(), quality=quality)
     with open(output_path, "wb") as out:
         out.write(result)
 
 
 # ---------------------------------------------------------------------------
-# Public entry point
+# Public entry points
 # ---------------------------------------------------------------------------
 
 def run_inference(
@@ -156,7 +216,7 @@ def run_inference(
     quality: str | None = None,
 ) -> None:
     """
-    End-to-end background removal for a single image.
+    End-to-end background removal for a single image (file-based interface).
 
     Selects the active back-end via MODEL_BACKEND, runs the full pipeline,
     and writes the transparent PNG to *output_path*.
@@ -186,3 +246,35 @@ def run_inference(
         )
 
     postprocess(raw_mask, image_path, output_path, original_size)
+
+
+def run_inference_bytes(
+    image_bytes: bytes,
+    quality: str | None = None,
+) -> bytes:
+    """
+    End-to-end background removal operating entirely in memory.
+
+    Avoids writing the source image to a temporary file — the bytes come
+    straight from the HTTP request and the result PNG bytes go straight
+    back to the caller.  Only supported for the rembg backend.
+
+    Args:
+        image_bytes: Raw source image bytes (JPEG / PNG / WebP).
+        quality:     "fast" or "quality".
+
+    Returns:
+        Transparent PNG as raw bytes.
+
+    Raises:
+        NotImplementedError: If MODEL_BACKEND is not "rembg".
+    """
+    effective_quality = quality or DEFAULT_QUALITY
+
+    if MODEL_BACKEND == "rembg":
+        return _run_rembg_bytes(image_bytes, quality=effective_quality)
+
+    raise NotImplementedError(
+        "run_inference_bytes is only supported for MODEL_BACKEND='rembg'. "
+        f"Current backend: '{MODEL_BACKEND}'."
+    )
