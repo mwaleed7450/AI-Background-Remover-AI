@@ -4,13 +4,16 @@ Mask post-processing and transparent PNG generation.
 Steps:
   1. Upsample the raw probability mask to the original image dimensions.
   2. Binarise / refine edges using morphological operations.
-  3. Apply the mask as an alpha channel to the original image.
-  4. Save the result as a transparent PNG.
+  3. (New) Build a trimap and run ML-based alpha matting for soft,
+     natural edges around hair/fur/fine detail.
+  4. Apply the mask (or matte) as an alpha channel to the original image.
+  5. Save the result as a transparent PNG.
 """
 
 import cv2
 import numpy as np
 from PIL import Image
+from pymatting import estimate_alpha_cf
 
 
 def upsample_mask(mask: np.ndarray, original_size: tuple[int, int]) -> np.ndarray:
@@ -68,6 +71,70 @@ def refine_mask(mask: np.ndarray) -> np.ndarray:
     return mask
 
 
+def generate_trimap(
+    mask: np.ndarray,
+    erosion_size: int = 15,
+    dilation_size: int = 15,
+) -> np.ndarray:
+    """
+    Build a 3-zone trimap from a binary mask, for use with alpha matting.
+
+    - Eroded region  -> definitely foreground (255)
+    - Outside the dilated region -> definitely background (0)
+    - Everything in between (the fuzzy border, e.g. hair) -> unknown (128)
+
+    Args:
+        mask:          uint8 binary mask (values 0 or 255), e.g. from
+                       binarise_mask().
+        erosion_size:  Kernel size used to shrink the foreground region.
+                       Larger = more of the border marked "unknown".
+        dilation_size: Kernel size used to expand the foreground region.
+                       Larger = more of the border marked "unknown".
+
+    Returns:
+        uint8 trimap with values 0, 128, or 255.
+    """
+    erosion_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (erosion_size, erosion_size)
+    )
+    dilation_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (dilation_size, dilation_size)
+    )
+
+    sure_fg = cv2.erode(mask, erosion_kernel, iterations=1)
+    sure_bg_inverse = cv2.dilate(mask, dilation_kernel, iterations=1)
+
+    trimap = np.full(mask.shape, 128, dtype=np.uint8)
+    trimap[sure_bg_inverse == 0] = 0
+    trimap[sure_fg == 255] = 255
+
+    return trimap
+
+
+def apply_alpha_matting(image_path: str, trimap: np.ndarray) -> np.ndarray:
+    """
+    Run closed-form alpha matting to produce a soft alpha matte from a
+    trimap, instead of a hard binary cutout. This is what gives natural,
+    semi-transparent edges around hair/fur/fine detail.
+
+    Args:
+        image_path: Path to the original source image.
+        trimap:     uint8 trimap (0 / 128 / 255) matching the image's
+                    pixel dimensions, e.g. from generate_trimap().
+
+    Returns:
+        uint8 alpha matte of shape (H, W), values 0-255.
+    """
+    image = Image.open(image_path).convert("RGB")
+    image_arr = np.asarray(image, dtype=np.float64) / 255.0
+    trimap_arr = trimap.astype(np.float64) / 255.0
+
+    alpha = estimate_alpha_cf(image_arr, trimap_arr)
+    alpha_uint8 = np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
+
+    return alpha_uint8
+
+
 def apply_mask(image_path: str, mask: np.ndarray, output_path: str) -> None:
     """
     Apply a refined alpha mask to the original image and save as a
@@ -96,10 +163,15 @@ def postprocess(
     output_path: str,
     original_size: tuple[int, int],
     threshold: float = 0.5,
+    use_matting: bool = True,
 ) -> None:
     """
-    Full post-processing pipeline:
-    upsample → binarise → refine → apply alpha → save PNG.
+    Full post-processing pipeline.
+
+    With matting (default):
+        upsample -> binarise -> refine -> trimap -> alpha matting -> apply -> save
+    Without matting (legacy path, e.g. as a fallback):
+        upsample -> binarise -> refine -> apply -> save
 
     Args:
         raw_mask:      Model output probability map, shape (H, W), float32.
@@ -107,8 +179,22 @@ def postprocess(
         output_path:   Where to write the transparent PNG.
         original_size: (width, height) of the original image.
         threshold:     Binarisation threshold (default 0.5).
+        use_matting:   If True, refine edges with ML-based alpha matting
+                       for soft hair/fur detail. If False, use the plain
+                       binarised + morphologically refined mask.
     """
     mask = upsample_mask(raw_mask, original_size)
     mask = binarise_mask(mask, threshold)
     mask = refine_mask(mask)
+
+    if use_matting:
+        try:
+            trimap = generate_trimap(mask)
+            mask = apply_alpha_matting(image_path, trimap)
+        except Exception as exc:
+            # Fall back to the plain refined mask rather than failing
+            # the whole request if matting errors out on an odd input.
+            print(f"[postprocess] Alpha matting failed, falling back "
+                  f"to binary mask: {exc}")
+
     apply_mask(image_path, mask, output_path)
