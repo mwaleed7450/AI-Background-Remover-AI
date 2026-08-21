@@ -5,6 +5,9 @@ Two pipelines live here:
 
   1. raw_mask pipeline  (ONNX / PyTorch backends)
      upsample → binarise → refine → apply alpha → save PNG
+     Alpha refinement defaults to guided-filter matting; closed-form
+     trimap-based matting (pymatting) is available as an opt-in for
+     higher-fidelity hair/fur edges on smaller images.
 
   2. rgba_bytes pipeline  (rembg backend)
      rembg already returns an RGBA PNG — we refine the alpha channel it
@@ -12,10 +15,12 @@ Two pipelines live here:
      semi-transparent pixels at subject boundaries via guided matting.
 """
 
+import io
+
 import cv2
 import numpy as np
 from PIL import Image
-import io
+from pymatting import estimate_alpha_cf
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -223,6 +228,72 @@ def refine_mask(mask: np.ndarray) -> np.ndarray:
     return refine_alpha(mask, aggressive=False)
 
 
+def generate_trimap(
+    mask: np.ndarray,
+    erosion_size: int = 15,
+    dilation_size: int = 15,
+) -> np.ndarray:
+    """
+    Build a 3-zone trimap from a binary mask, for use with alpha matting.
+
+    - Eroded region  -> definitely foreground (255)
+    - Outside the dilated region -> definitely background (0)
+    - Everything in between (the fuzzy border, e.g. hair) -> unknown (128)
+
+    Args:
+        mask:          uint8 binary mask (values 0 or 255), e.g. from
+                       binarise_mask().
+        erosion_size:  Kernel size used to shrink the foreground region.
+                       Larger = more of the border marked "unknown".
+        dilation_size: Kernel size used to expand the foreground region.
+                       Larger = more of the border marked "unknown".
+
+    Returns:
+        uint8 trimap with values 0, 128, or 255.
+    """
+    erosion_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (erosion_size, erosion_size)
+    )
+    dilation_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (dilation_size, dilation_size)
+    )
+
+    sure_fg = cv2.erode(mask, erosion_kernel, iterations=1)
+    sure_bg_inverse = cv2.dilate(mask, dilation_kernel, iterations=1)
+
+    trimap = np.full(mask.shape, 128, dtype=np.uint8)
+    trimap[sure_bg_inverse == 0] = 0
+    trimap[sure_fg == 255] = 255
+
+    return trimap
+
+
+def apply_alpha_matting(image_path: str, trimap: np.ndarray) -> np.ndarray:
+    """
+    Run closed-form alpha matting to produce a soft alpha matte from a
+    trimap, instead of a hard binary cutout. Gives natural, semi-transparent
+    edges around hair/fur/fine detail, but is memory-hungry and can fail on
+    larger images — callers should treat this as an opt-in, best-effort
+    refinement and fall back to guided_alpha_matting() on failure.
+
+    Args:
+        image_path: Path to the original source image.
+        trimap:     uint8 trimap (0 / 128 / 255) matching the image's
+                    pixel dimensions, e.g. from generate_trimap().
+
+    Returns:
+        uint8 alpha matte of shape (H, W), values 0-255.
+    """
+    image = Image.open(image_path).convert("RGB")
+    image_arr = np.asarray(image, dtype=np.float64) / 255.0
+    trimap_arr = trimap.astype(np.float64) / 255.0
+
+    alpha = estimate_alpha_cf(image_arr, trimap_arr)
+    alpha_uint8 = np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
+
+    return alpha_uint8
+
+
 def apply_mask(image_path: str, mask: np.ndarray, output_path: str) -> None:
     """
     Apply a refined alpha mask to the original image and save as a
@@ -245,10 +316,32 @@ def postprocess(
     output_path: str,
     original_size: tuple[int, int],
     threshold: float = 0.5,
+    use_matting: bool = True,
+    use_cf_matting: bool = False,
 ) -> None:
     """
     Full post-processing pipeline for ONNX/PyTorch backends:
-    upsample → binarise → refine → guided matting → apply alpha → save PNG.
+    upsample → binarise → refine → alpha refinement → apply alpha → save PNG.
+
+    Alpha refinement step:
+      - use_matting=True, use_cf_matting=False (default): guided-filter
+        matting — fast, robust, handles any image size.
+      - use_matting=True, use_cf_matting=True: closed-form trimap-based
+        matting (pymatting) for higher-fidelity hair/fur edges on smaller
+        images. Falls back to guided-filter matting automatically if it
+        errors (e.g. memory allocation failure on larger images).
+      - use_matting=False: skip alpha refinement, use the plain
+        binarised + morphologically refined mask.
+
+    Args:
+        raw_mask:       Model output probability map, shape (H, W), float32.
+        image_path:     Path to the original source image.
+        output_path:    Where to write the transparent PNG.
+        original_size:  (width, height) of the original image.
+        threshold:      Binarisation threshold (default 0.5).
+        use_matting:    Whether to run any alpha-matting refinement at all.
+        use_cf_matting: Whether to prefer closed-form (pymatting) matting
+                        over the default guided-filter matting.
     """
     # Load original RGB for guided matting
     orig = cv2.imread(image_path, cv2.IMREAD_COLOR)
@@ -258,10 +351,26 @@ def postprocess(
     mask = binarise_mask(mask, threshold)
     mask = refine_mask(mask)
 
-    if rgb is not None:
-        # Resize RGB to match mask if needed
-        if rgb.shape[:2] != mask.shape[:2]:
-            rgb = cv2.resize(rgb, (mask.shape[1], mask.shape[0]))
-        mask = guided_alpha_matting(rgb, mask, radius=5)
+    def _run_guided_matting(current_mask: np.ndarray) -> np.ndarray:
+        if rgb is None:
+            return current_mask
+        guide_rgb = rgb
+        if guide_rgb.shape[:2] != current_mask.shape[:2]:
+            guide_rgb = cv2.resize(guide_rgb, (current_mask.shape[1], current_mask.shape[0]))
+        return guided_alpha_matting(guide_rgb, current_mask, radius=5)
+
+    if use_matting:
+        if use_cf_matting:
+            try:
+                trimap = generate_trimap(mask)
+                mask = apply_alpha_matting(image_path, trimap)
+            except Exception as exc:
+                # Fall back to guided-filter matting rather than failing
+                # the whole request if closed-form matting errors out.
+                print(f"[postprocess] Closed-form alpha matting failed, "
+                      f"falling back to guided filter matting: {exc}")
+                mask = _run_guided_matting(mask)
+        else:
+            mask = _run_guided_matting(mask)
 
     apply_mask(image_path, mask, output_path)
